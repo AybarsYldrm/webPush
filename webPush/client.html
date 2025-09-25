@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>WebPush Demo — Düzenlenmiş</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; margin: 18px; color: #0a0a0a; }
+    h1 { margin-bottom: 6px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+    button, select, input, textarea { padding:8px 10px; border-radius:6px; border:1px solid #ddd; background:#fff; }
+    button { cursor:pointer; }
+    #out { white-space: pre-wrap; background:#0f172a; color:#e6eef8; padding:12px; border-radius:8px; min-height:120px; max-height:36vh; overflow:auto; }
+    label { font-size:13px; color:#374151; margin-right:6px; }
+    .col { display:flex; flex-direction:column; gap:8px; }
+    textarea { min-width:420px; min-height:90px; max-width:100%; resize:vertical; }
+    .small { font-size:13px; color:#6b7280; }
+    .success { color: #065f46; }
+  </style>
+</head>
+<body>
+  <h1>Web Push Demo (Düzenli)</h1>
+  <p class="small">SW kayıt/güncelleme, subscribe/unsubscribe, ve /send test arayüzü. Cloudflare cache problemi için <strong>Register SW</strong> versiyon paramı kullanır.</p>
+
+  <div class="row">
+    <button id="register-sw">Register SW (force update)</button>
+    <button id="update-sw">Update SW (reg.update())</button>
+    <button id="unregister-sw">Unregister SW</button>
+    <button id="show-sw">Show SW Status</button>
+  </div>
+
+  <div class="row">
+    <button id="subscribe">Subscribe for Push</button>
+    <button id="unsubscribe">Unsubscribe</button>
+    <button id="show-sub">Show Subscription</button>
+    <button id="copy-sub">Copy Subscription JSON</button>
+  </div>
+
+  <div style="margin-top:12px;" class="col">
+    <label>Payload (JSON OR plain text)</label>
+    <textarea id="payload">{"title":"Test","body":"Deneme mesajı"}</textarea>
+    <div class="row">
+      <label for="ctype">Content-Type:</label>
+      <select id="ctype">
+        <option value="application/json">application/json</option>
+        <option value="text/plain">text/plain</option>
+      </select>
+      <label for="ttl">TTL (s)</label>
+      <input id="ttl" type="number" value="60" style="width:100px" />
+      <button id="send">Trigger Send (server /send)</button>
+    </div>
+  </div>
+
+  <div style="margin-top:14px;">
+    <strong>Logs:</strong>
+    <pre id="out"></pre>
+  </div>
+
+<script>
+const outEl = document.getElementById('out');
+const out = (t) => {
+  const ts = new Date().toLocaleTimeString();
+  outEl.textContent = `[${ts}] ${t}\n` + outEl.textContent;
+};
+
+// helpers
+async function toUint8Array(base64String) {
+  const padding = '='.repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
+
+async function getVapidPublicKey() {
+  try {
+    const r = await fetch('/vapidPublicKey');
+    if (!r.ok) throw new Error('vapidPublicKey error ' + r.status);
+    const j = await r.json();
+    return j.publicKey;
+  } catch (e) {
+    out('VAPID key fetch error: ' + e);
+    throw e;
+  }
+}
+
+async function getRegistration() {
+  return await navigator.serviceWorker.getRegistration();
+}
+
+// SW register / update / unregister
+document.getElementById('register-sw').addEventListener('click', async () => {
+  try {
+    if (!('serviceWorker' in navigator)) { out('Service Worker desteklenmiyor'); return; }
+    // Bypass Cloudflare/browser cache using a version query param
+    const swUrl = '/sw.js?v=' + Date.now();
+    out('Registering SW: ' + swUrl);
+    const reg = await navigator.serviceWorker.register(swUrl);
+    out('SW registered: scope=' + reg.scope);
+    // request immediate activation
+    try { await reg.update(); out('Requested update'); } catch(e){ out('update() failed: '+e) }
+    // ask SW to skipWaiting (if SW implements skipWaiting it will activate immediately)
+  } catch (e) {
+    out('SW register failed: ' + e);
+  }
+});
+
+document.getElementById('update-sw').addEventListener('click', async () => {
+  try {
+    const reg = await getRegistration();
+    if (!reg) { out('No registration found'); return; }
+    await reg.update();
+    out('reg.update() called');
+  } catch (e) {
+    out('update error: ' + e);
+  }
+});
+
+document.getElementById('unregister-sw').addEventListener('click', async () => {
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    if (!regs || regs.length === 0) { out('No SW registrations'); return; }
+    for (const r of regs) {
+      const ok = await r.unregister();
+      out('Unregistered scope=' + r.scope + ' => ' + ok);
+    }
+  } catch (e) {
+    out('unregister error: ' + e);
+  }
+});
+
+document.getElementById('show-sw').addEventListener('click', async () => {
+  try {
+    const reg = await getRegistration();
+    if (!reg) { out('No SW registration'); return; }
+    out('SW: scope=' + reg.scope + ' active=' + Boolean(reg.active) + ' waiting=' + Boolean(reg.waiting) + ' installing=' + Boolean(reg.installing));
+  } catch (e) { out('show-sw error: ' + e); }
+});
+
+// Push subscribe/unsubscribe
+async function currentSubscription() {
+  const reg = await navigator.serviceWorker.getRegistration();
+  if (!reg) return null;
+  return await reg.pushManager.getSubscription();
+}
+
+document.getElementById('subscribe').addEventListener('click', async () => {
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) { out('Push/ServiceWorker desteklenmiyor'); return; }
+    const reg = await navigator.serviceWorker.register('/sw.js?v=' + Date.now());
+    out('SW (for subscribe) ready: ' + reg.scope);
+
+    const publicKey = await getVapidPublicKey();
+    const applicationServerKey = await toUint8Array(publicKey);
+
+    const existing = await reg.pushManager.getSubscription();
+    if (existing) {
+      out('Zaten abonelik var.');
+      out(JSON.stringify(existing));
+      return;
+    }
+
+    const sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey
+    });
+    out('Subscribed ok — sending to server...');
+    await fetch('/subscribe', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(sub) });
+    out('Subscription sent to server.');
+    out(JSON.stringify(sub));
+  } catch (e) {
+    out('subscribe error: ' + e);
+  }
+});
+
+document.getElementById('unsubscribe').addEventListener('click', async () => {
+  try {
+    const sub = await currentSubscription();
+    if (!sub) { out('No subscription to unsubscribe'); return; }
+    const ok = await sub.unsubscribe();
+    out('Unsubscribe result: ' + ok);
+    // Optionally notify server to remove subscription (not implemented server-side by default)
+  } catch (e) { out('unsubscribe error: ' + e); }
+});
+
+document.getElementById('show-sub').addEventListener('click', async () => {
+  try {
+    const sub = await currentSubscription();
+    if (!sub) { out('No subscription'); return; }
+    out('Subscription:\n' + JSON.stringify(sub));
+  } catch (e) { out('show-sub error: ' + e); }
+});
+
+document.getElementById('copy-sub').addEventListener('click', async () => {
+  try {
+    const sub = await currentSubscription();
+    if (!sub) { out('No subscription to copy'); return; }
+    const text = JSON.stringify(sub);
+    await navigator.clipboard.writeText(text);
+    out('Subscription JSON kopyalandı (clipboard).');
+  } catch (e) { out('copy error: ' + e); }
+});
+
+// /send handler (supports application/json and text/plain)
+document.getElementById('send').addEventListener('click', async () => {
+  try {
+    const payload = document.getElementById('payload').value;
+    const ctype = document.getElementById('ctype').value;
+    const ttl = Number(document.getElementById('ttl').value) || 60;
+    const opts = { method: 'POST', headers: { 'Content-Type': ctype } };
+    if (ctype === 'application/json') {
+      // If user typed plain text but picked JSON, try to parse; otherwise send as-is if valid JSON not mandatory
+      let body = payload;
+      try { JSON.parse(payload); } catch(e) { out('Uyarı: payload valid JSON değil, yine de gönderiliyor'); }
+      opts.body = payload;
+    } else {
+      opts.body = payload;
+    }
+    // append ttl/subject only for JSON path — server expects them in JSON; for text/plain it's raw
+    if (ctype === 'application/json') {
+      // ensure ttl present in JSON -> merge it
+      try {
+        const obj = JSON.parse(payload);
+        obj.ttl = ttl;
+        opts.body = JSON.stringify(obj);
+      } catch (e) {
+        // if parsing failed, wrap in object
+        opts.body = JSON.stringify({ title: payload, body: payload, ttl });
+      }
+    }
+    out('Sending /send with content-type=' + ctype);
+    const r = await fetch('/send', opts);
+    if (!r.ok) {
+      out('send returned ' + r.status + ' ' + await r.text());
+      return;
+    }
+    const json = await r.json();
+    out('Send response: ' + JSON.stringify(json, null, 2));
+  } catch (e) {
+    out('send error: ' + e);
+  }
+});
+
+// initial hint
+out('Client hazır. Önce "Register SW" sonra "Subscribe" yap. Eğer Cloudflare cache varsa Register SW ile SW versiyon sorgusu atlayacaktır.');
+</script>
+</body>
+</html>
